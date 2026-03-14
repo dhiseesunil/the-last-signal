@@ -1,0 +1,1200 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>The Last Signal</title>
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="shortcut icon" href="logo.png">
+<style>
+  body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;}
+  canvas{border:1px solid #222;background:#000;cursor:default;}
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d", { willReadFrequently:true });
+
+// ---------- AUDIO ----------
+const stepSound = new Audio("playersteps.mp3");
+stepSound.volume = 0.6;
+stepSound.preload = "auto";
+
+const hitSound = new Audio("hit.mp3");
+hitSound.volume = 0.7;
+hitSound.preload = "auto";
+
+const dodgeSound = new Audio("dodge.mp3");
+dodgeSound.volume = 0.7;
+dodgeSound.preload = "auto";
+
+const horrorMusic = new Audio("horror.mp3");
+horrorMusic.volume = 0.5;
+horrorMusic.loop = true;
+horrorMusic.preload = "auto";
+
+const flareSound = new Audio("flare.mp3");
+flareSound.volume = 0.85;
+flareSound.preload = "auto";
+
+const helicopterSound = new Audio("helicopter.mp3");
+helicopterSound.volume = 0.85;
+helicopterSound.preload = "auto";
+
+let audioUnlocked = false;
+function unlockAudio(){
+  if(audioUnlocked) return;
+  audioUnlocked = true;
+
+  const allAudio = [stepSound, hitSound, dodgeSound, horrorMusic, flareSound, helicopterSound];
+  for(const a of allAudio){
+    a.play().then(()=>{
+      a.pause();
+      a.currentTime = 0;
+    }).catch(()=>{});
+  }
+}
+window.addEventListener("keydown", unlockAudio, { once:true });
+window.addEventListener("mousedown", unlockAudio, { once:true });
+
+// ---------- LOAD ----------
+function loadImage(src){
+  return new Promise((res,rej)=>{
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = () => rej(new Error("Failed to load: " + src));
+    i.src = "./" + src + "?v=" + Date.now();
+  });
+}
+
+// ---------- HELPERS ----------
+function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+function dist(ax,ay,bx,by){ return Math.hypot(ax-bx, ay-by); }
+function inRect(x,y,r){
+  return x >= Math.min(r.x1,r.x2) && x <= Math.max(r.x1,r.x2) &&
+         y >= Math.min(r.y1,r.y2) && y <= Math.max(r.y1,r.y2);
+}
+function rectsOverlap(a,b){
+  return a.x < b.x + b.w &&
+         a.x + a.w > b.x &&
+         a.y < b.y + b.h &&
+         a.y + a.h > b.y;
+}
+function facingFromVelocity(vx,vy,current="down"){
+  if(Math.abs(vx)<0.01 && Math.abs(vy)<0.01) return current;
+  if(Math.abs(vx)>Math.abs(vy)) return vx>0 ? "right" : "left";
+  return vy>0 ? "down" : "up";
+}
+function playStepSound(){
+  if(stepSound.paused){
+    stepSound.currentTime = 0;
+    stepSound.play().catch(()=>{});
+  }
+}
+function playHitSound(){
+  hitSound.currentTime = 0;
+  hitSound.play().catch(()=>{});
+}
+function playDodgeSound(){
+  dodgeSound.currentTime = 0;
+  dodgeSound.play().catch(()=>{});
+}
+
+// sprites face DOWN
+function angleForFacing(f){
+  if(f==="down") return 0;
+  if(f==="left") return Math.PI/2;
+  if(f==="right") return -Math.PI/2;
+  if(f==="up") return Math.PI;
+  return 0;
+}
+
+function drawRotated(img,x,y,size,facing,extraRot=0,scale=1){
+  ctx.save();
+  ctx.translate(x+size/2, y+size/2);
+  ctx.rotate(angleForFacing(facing)+extraRot);
+  ctx.scale(scale,scale);
+  ctx.drawImage(img,-size/2,-size/2,size,size);
+  ctx.restore();
+}
+
+function drawStatus(lines){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle="#000";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle="#9f9";
+  ctx.font="16px monospace";
+  let y=40;
+  for(const line of (Array.isArray(lines)?lines:[String(lines)])){
+    ctx.fillText(line, 20, y);
+    y += 22;
+  }
+}
+
+function makeCannibal(x,y){
+  return {x,y,w:64,h:64,hp:80,maxHp:80,alive:true,facing:"down",cooldown:0,vx:0,vy:0};
+}
+
+function makeItem(type,x,y,w=40,h=40,label=""){
+  return { type, x, y, w, h, picked:false, label };
+}
+
+// ---------- COLLISION ----------
+const WALKABLE_SUM_THRESHOLD = 420;
+
+function buildMaskAndOverlay(collisionImg){
+  const c = document.createElement("canvas");
+  c.width = collisionImg.width;
+  c.height = collisionImg.height;
+  const cctx = c.getContext("2d", { willReadFrequently:true });
+  cctx.drawImage(collisionImg, 0, 0);
+
+  let imgData;
+  try{
+    imgData = cctx.getImageData(0,0,c.width,c.height);
+  }catch(e){
+    throw new Error(
+      "Blocked reading pixels.\nRun local server:\npython -m http.server 8000\nOpen http://localhost:8000"
+    );
+  }
+
+  const colData = imgData.data;
+  const colW = c.width;
+  const colH = c.height;
+
+  const overlay = cctx.createImageData(colW, colH);
+  const od = overlay.data;
+
+  for(let i=0;i<colData.length;i+=4){
+    const sum = colData[i] + colData[i+1] + colData[i+2];
+    if(sum >= WALKABLE_SUM_THRESHOLD){
+      od[i]=0; od[i+1]=255; od[i+2]=0; od[i+3]=110;
+    }else{
+      od[i]=255; od[i+1]=0; od[i+2]=0; od[i+3]=110;
+    }
+  }
+
+  const oc = document.createElement("canvas");
+  oc.width = colW;
+  oc.height = colH;
+  oc.getContext("2d").putImageData(overlay, 0, 0);
+
+  return { colData, colW, colH, overlayCanvas: oc };
+}
+
+function isWalkable(mask, x, y){
+  x = Math.floor(x);
+  y = Math.floor(y);
+  if(x<0 || y<0 || x>=mask.colW || y>=mask.colH) return false;
+  const idx = (y*mask.colW + x) * 4;
+  const r = mask.colData[idx];
+  const g = mask.colData[idx+1];
+  const b = mask.colData[idx+2];
+  return (r+g+b) >= WALKABLE_SUM_THRESHOLD;
+}
+
+function canMoveFeetBoxPlayer(mask, nx, ny, w, h){
+  const boxW = 10, boxH = 10;
+  const fx = nx + w/2 - boxW/2;
+  const fy = ny + h - boxH - 6;
+  const pts = [
+    [fx, fy],
+    [fx + boxW, fy],
+    [fx, fy + boxH],
+    [fx + boxW, fy + boxH],
+  ];
+  for(const [px,py] of pts){
+    if(!isWalkable(mask, px, py)) return false;
+  }
+  return true;
+}
+
+function canMoveFeetBoxCannibal(mask, nx, ny, w, h){
+  const boxW = 4, boxH = 4;
+  const fx = nx + w/2 - boxW/2;
+  const fy = ny + h - boxH - 4;
+  const pts = [
+    [fx, fy],
+    [fx + boxW, fy],
+    [fx, fy + boxH],
+    [fx + boxW, fy + boxH],
+  ];
+  for(const [px,py] of pts){
+    if(!isWalkable(mask, px, py)) return false;
+  }
+  return true;
+}
+
+function moveWithMaskPlayer(mask, entity, dx, dy){
+  if(dx !== 0){
+    const nx = entity.x + dx;
+    if(canMoveFeetBoxPlayer(mask, nx, entity.y, entity.w, entity.h)) entity.x = nx;
+  }
+  if(dy !== 0){
+    const ny = entity.y + dy;
+    if(canMoveFeetBoxPlayer(mask, entity.x, ny, entity.w, entity.h)) entity.y = ny;
+  }
+}
+
+function moveWithMaskCannibal(mask, entity, dx, dy){
+  if(dx !== 0){
+    const nx = entity.x + dx;
+    if(canMoveFeetBoxCannibal(mask, nx, entity.y, entity.w, entity.h)) entity.x = nx;
+  }
+  if(dy !== 0){
+    const ny = entity.y + dy;
+    if(canMoveFeetBoxCannibal(mask, entity.x, ny, entity.w, entity.h)) entity.y = ny;
+  }
+}
+
+// ---------- TRANSITIONS ----------
+const transitions = {
+  hospital: [
+    {
+      zone: { x1:1048, x2:1110, y1:1270, y2:1340 },
+      targetScene: "street",
+      playerTo: { x:340, y:306 },
+      cannibalTo: { x:340, y:306 }
+    }
+  ],
+  street: [
+    {
+      zone: { x1:273, x2:421, y1:309, y2:350 },
+      targetScene: "hospital",
+      playerTo: { x:1070, y:1300 },
+      cannibalTo: { x:1070, y:1300 }
+    },
+    {
+      zone: { x1:320, x2:400, y1:720, y2:740 },
+      targetScene: "bakery",
+      playerTo: { x:724, y:175 },
+      cannibalTo: { x:724, y:175 }
+    },
+    {
+      zone: { x1:1462, x2:1535, y1:719, y2:1023 },
+      targetScene: "ferry",
+      playerTo: { x:918, y:931 },
+      cannibalTo: { x:918, y:931 }
+    }
+  ],
+  bakery: [
+    {
+      zone: { x1:1012, x2:1534, y1:966, y2:1020 },
+      targetScene: "street",
+      playerTo: { x:988, y:852 },
+      playerOnly: true
+    },
+    {
+      zone: { x1:657, x2:789, y1:109, y2:215},
+      targetScene: "street",
+      playerTo: { x:337, y:773 },
+      cannibalTo: { x:337, y:773 }
+    }
+  ],
+  ferry: [
+    {
+      zone: { x1:770, x2:1020, y1:970, y2:1022},
+      targetScene: "street",
+      playerTo: { x:1412, y:927 },
+      cannibalTo: { x:1412, y:927 }
+    }
+  ]
+};
+
+// ---------- GAME ----------
+(async function main(){
+  try{
+    drawStatus(["Loading... This may take 3 to 4 minutes"]);
+
+    const [
+      playerImg, cannibalImg,
+      healthImg, flareImg, energyImg, foodImg,
+      start1Img, start2Img, start3Img,
+      final1Img, final2Img,
+      hospitalImg, hospitalColImg,
+      streetImg, streetColImg,
+      bakeryImg, bakeryColImg,
+      ferryImg, ferryColImg
+    ] = await Promise.all([
+      loadImage("player.png"),
+      loadImage("cannibal.png"),
+
+      loadImage("healthkit.png"),
+      loadImage("flaregun.png"),
+      loadImage("energydrink.png"),
+      loadImage("food.png"),
+
+      loadImage("start1.png"),
+      loadImage("start2.png"),
+      loadImage("start3.png"),
+
+      loadImage("final1.png"),
+      loadImage("final2.png"),
+
+      loadImage("hospital.png"),
+      loadImage("hospital_collision.png"),
+
+      loadImage("street.png"),
+      loadImage("street_collision.png"),
+
+      loadImage("bakery.png"),
+      loadImage("bakery_collision.png"),
+
+      loadImage("ferry.png"),
+      loadImage("ferry_collision.png"),
+    ]);
+
+    function createScenes(){
+      return {
+        hospital: {
+          map: hospitalImg,
+          mask: buildMaskAndOverlay(hospitalColImg),
+          cannibals: [
+            makeCannibal(960,180),
+            makeCannibal(1050,520),
+            makeCannibal(420,620),
+            makeCannibal(1070, 1232),
+            makeCannibal(604, 818),
+            makeCannibal(1015, 1201),
+            makeCannibal(1748, 1014),
+            makeCannibal(1701, 1086),
+            makeCannibal(1831, 1115),
+            makeCannibal(1530, 1136),
+          ],
+          items: [
+            makeItem("health", 286, 28, 30, 30),
+            makeItem("health", 237, 0, 30, 30),
+            makeItem("health", 182, 31, 30, 30),
+            makeItem("health", 820, 260, 30, 30),
+            makeItem("health", 1150, 700, 30, 30),
+            makeItem("health", 520, 980, 30, 30),
+            makeItem("health", 196, 1156, 30, 30),
+            makeItem("health", 1408, 694, 30, 30),
+            makeItem("health", 1884, 1093, 30, 30),
+            makeItem("health", 1827, 1103, 30, 30),
+            makeItem("health", 1788, 1150, 30, 30),
+            makeItem("health", 1728, 1150, 30, 30),
+            makeItem("health", 1799, 1010, 30, 30),
+            makeItem("health", 1637, 947, 30, 30),
+            makeItem("fuel", 1869, 214, 20, 35),
+          ]
+        },
+        street: {
+          map: streetImg,
+          mask: buildMaskAndOverlay(streetColImg),
+          cannibals: [
+            makeCannibal(70, 378),
+            makeCannibal(604, 818),
+            makeCannibal(582, 413),
+            makeCannibal(20, 264),
+            makeCannibal(0, 625),
+            makeCannibal(20, 472),
+            makeCannibal(572, 162),
+            makeCannibal(504, 602),
+            makeCannibal(163, 726),
+            makeCannibal(834, 661),
+            makeCannibal(782, 779),
+            makeCannibal(741, 780),
+            makeCannibal(694, 825),
+            makeCannibal(824, 835),
+            makeCannibal(884, 952),
+            makeCannibal(928, 825),
+            makeCannibal(1034, 879),
+            makeCannibal(949, 258),
+            makeCannibal(910, 484),
+            makeCannibal(920, 588),
+            makeCannibal(975, 137),
+            makeCannibal(928, 59),
+            makeCannibal(1120, 124),
+          ],
+          items: [
+            makeItem("fuel", 1341, 0, 20, 35),
+            makeItem("fuel", 1364, 184, 20, 35),
+          ]
+        },
+        bakery: {
+          map: bakeryImg,
+          mask: buildMaskAndOverlay(bakeryColImg),
+          cannibals: [
+            makeCannibal(123, 650),
+            makeCannibal(1220, 620),
+            makeCannibal(315, 710),
+            makeCannibal(682, 915),
+            makeCannibal(554, 902),
+            makeCannibal(1023, 777),
+            makeCannibal(117, 90),
+            makeCannibal(257, 306),
+          ],
+          items: [
+            makeItem("food", 445, 159, 30, 35),
+            makeItem("food", 372, 159, 30, 35),
+            makeItem("food", 323, 159, 30, 35),
+            makeItem("food", 263, 193, 30, 35),
+            makeItem("food", 1295, 141, 30, 35),
+            makeItem("food", 443, 364, 30, 35),
+          ]
+        },
+        ferry: {
+          map: ferryImg,
+          mask: buildMaskAndOverlay(ferryColImg),
+          cannibals: [
+            makeCannibal(787, 684),
+            makeCannibal(821, 852),
+            makeCannibal(873, 826),
+            makeCannibal(907, 826),
+            makeCannibal(957, 826),
+            makeCannibal(977, 852),
+            makeCannibal(988, 876),
+            makeCannibal(865, 704),
+            makeCannibal(925, 769),
+            makeCannibal(460, 600),
+            makeCannibal(319, 436),
+            makeCannibal(1800, 487),
+            makeCannibal(619, 401),
+            makeCannibal(689, 448),
+          ],
+          items: [
+            makeItem("flare", 460, 341, 30, 40),
+            makeItem("fuel", 914, 684, 20, 35),
+          ]
+        }
+      };
+    }
+
+    const SIZE = 64;
+    let scenes = createScenes();
+    let scene = "hospital";
+    let showDebug = true;
+    let sceneCooldownMs = 0;
+    const camera = { x:0, y:0 };
+    let messageText = "";
+    let messageTimer = 0;
+
+    let gameState = "intro";
+    const introImages = [start1Img, start2Img, start2Img, start2Img, start2Img, start2Img, start2Img, start3Img];
+    let introIndex = 0;
+    let introTimer = 0;
+
+    const INTRO_FADE_MS = 1000;
+    const INTRO_HOLD_MS = 3500;
+    const INTRO_IMAGE_DURATION = INTRO_FADE_MS + INTRO_HOLD_MS + INTRO_FADE_MS;
+
+    let endingState = "play"; // play | final1 | final2 | ended
+    let endingLocked = false;
+    let final1Timer = 0;
+    let final2Timer = 0;
+
+    const FINAL1_DURATION = 2500;
+    const FINAL2_DURATION = 5000;
+    const ENDING_FADE_MS = 1000;
+
+    const player = {
+      x: scenes.hospital.map.width * 0.20,
+      y: scenes.hospital.map.height * 0.22,
+      w: SIZE, h: SIZE,
+      speed: 2.6,
+      hp: 100,
+      maxHp: 100,
+      fuel: 0,
+      hasFlareGun: false,
+      facing: "down",
+      attackTime: 0,
+      attackCooldown: 0,
+      dodgeTime: 0,
+      invuln: 0,
+      spinAngle: 0,
+    };
+
+    const playAgainButton = {
+      x: canvas.width/2 - 120,
+      y: canvas.height/2 + 40,
+      w: 240,
+      h: 56,
+      hovered: false
+    };
+
+    function currentMap(){ return scenes[scene].map; }
+    function currentMask(){ return scenes[scene].mask; }
+    function currentCannibals(){ return scenes[scene].cannibals; }
+    function currentItems(){ return scenes[scene].items; }
+
+    function showMessage(text){
+      messageText = text;
+      messageTimer = 1800;
+    }
+
+    function stopAudio(audio){
+      audio.pause();
+      audio.currentTime = 0;
+    }
+
+    function stopAllActionSounds(){
+      stopAudio(stepSound);
+      stopAudio(hitSound);
+      stopAudio(dodgeSound);
+    }
+
+    function stopAllAudio(){
+      stopAudio(stepSound);
+      stopAudio(hitSound);
+      stopAudio(dodgeSound);
+      stopAudio(horrorMusic);
+      stopAudio(flareSound);
+      stopAudio(helicopterSound);
+    }
+
+    function startHorrorMusic(){
+      if(!audioUnlocked) return;
+      if(!horrorMusic.paused) return;
+      horrorMusic.currentTime = 0;
+      horrorMusic.play().catch(()=>{});
+    }
+
+    function resetMovementKeys(){
+      keys.up = false;
+      keys.down = false;
+      keys.left = false;
+      keys.right = false;
+      attackPressed = false;
+      dodgePressed = false;
+    }
+
+    function startGameNow(){
+      gameState = "play";
+      introIndex = introImages.length;
+      introTimer = 0;
+      resetMovementKeys();
+      startHorrorMusic();
+    }
+
+    function restartGame(){
+      stopAllAudio();
+      scenes = createScenes();
+      scene = "hospital";
+      showDebug = true;
+      sceneCooldownMs = 0;
+      camera.x = 0;
+      camera.y = 0;
+      messageText = "";
+      messageTimer = 0;
+
+      gameState = "intro";
+      introIndex = 0;
+      introTimer = 0;
+
+      endingState = "play";
+      endingLocked = false;
+      final1Timer = 0;
+      final2Timer = 0;
+
+      player.x = scenes.hospital.map.width * 0.20;
+      player.y = scenes.hospital.map.height * 0.22;
+      player.w = SIZE;
+      player.h = SIZE;
+      player.speed = 2.6;
+      player.hp = 100;
+      player.maxHp = 100;
+      player.fuel = 0;
+      player.hasFlareGun = false;
+      player.facing = "down";
+      player.attackTime = 0;
+      player.attackCooldown = 0;
+      player.dodgeTime = 0;
+      player.invuln = 0;
+      player.spinAngle = 0;
+
+      gameOver = false;
+      resetMovementKeys();
+    }
+
+    function switchToFinal2(){
+      if(endingState !== "final1") return;
+
+      endingState = "final2";
+      final2Timer = FINAL2_DURATION;
+
+      stopAudio(flareSound);
+      helicopterSound.currentTime = 0;
+      helicopterSound.play().catch(()=>{});
+    }
+
+    function startEndingSequence(){
+      if(endingLocked) return;
+
+      endingLocked = true;
+      endingState = "final1";
+      final1Timer = FINAL1_DURATION;
+      final2Timer = 0;
+
+      stopAllActionSounds();
+      stopAudio(horrorMusic);
+      stopAudio(flareSound);
+      stopAudio(helicopterSound);
+
+      resetMovementKeys();
+
+      sceneCooldownMs = 0;
+      messageText = "";
+      messageTimer = 0;
+
+      flareSound.currentTime = 0;
+      flareSound.play().catch(()=>{});
+    }
+
+    const keys = { up:false, down:false, left:false, right:false };
+    let attackPressed = false;
+    let dodgePressed = false;
+
+    function isSpaceKey(e){
+      return e.code === "Space" || e.key === " " || e.key === "Spacebar";
+    }
+
+    function canShowPlayAgain(){
+      return gameOver || endingState === "ended";
+    }
+
+    function pointInButton(mx,my,btn){
+      return mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h;
+    }
+
+    window.addEventListener("keydown", e=>{
+      if(canShowPlayAgain()) return;
+
+      if(gameState === "intro"){
+        const currentIntroImg = introImages[introIndex];
+        const canSkipIntro = currentIntroImg === start2Img || currentIntroImg === start3Img;
+
+        if(isSpaceKey(e) && canSkipIntro){
+          e.preventDefault();
+          startGameNow();
+        }
+        return;
+      }
+
+      if(endingState !== "play") return;
+
+      if(e.key==="ArrowUp") keys.up=true;
+      if(e.key==="ArrowDown") keys.down=true;
+      if(e.key==="ArrowLeft") keys.left=true;
+      if(e.key==="ArrowRight") keys.right=true;
+      if(e.key==="e"||e.key==="E") attackPressed=true;
+      if(e.key==="d"||e.key==="D") dodgePressed=true;
+      if(e.key==="c"||e.key==="C") showDebug = !showDebug;
+    });
+
+    window.addEventListener("keyup", e=>{
+      if(e.key==="ArrowUp") keys.up=false;
+      if(e.key==="ArrowDown") keys.down=false;
+      if(e.key==="ArrowLeft") keys.left=false;
+      if(e.key==="ArrowRight") keys.right=false;
+    });
+
+    canvas.addEventListener("mousemove", e=>{
+      if(!canShowPlayAgain()){
+        playAgainButton.hovered = false;
+        canvas.style.cursor = "default";
+        return;
+      }
+
+      const rect = canvas.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+      playAgainButton.hovered = pointInButton(mx, my, playAgainButton);
+      canvas.style.cursor = playAgainButton.hovered ? "pointer" : "default";
+    });
+
+    canvas.addEventListener("click", e=>{
+      if(!canShowPlayAgain()) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+      if(pointInButton(mx, my, playAgainButton)){
+        restartGame();
+      }
+    });
+
+    const CHASE_RADIUS = 280;
+    const HIT_RANGE = 90;
+    const DAMAGE = 35;
+    const DODGE_SPEED = 8;
+    const CANNIBAL_DAMAGE = 5;
+
+    function transferCannibal(cannibal, fromSceneName, toSceneName, spawn){
+      const fromArr = scenes[fromSceneName].cannibals;
+      const toArr = scenes[toSceneName].cannibals;
+
+      const idx = fromArr.indexOf(cannibal);
+      if(idx !== -1) fromArr.splice(idx, 1);
+
+      cannibal.x = spawn.x;
+      cannibal.y = spawn.y;
+      cannibal.facing = "down";
+      toArr.push(cannibal);
+    }
+
+    function handleSceneTransitions(){
+      if(sceneCooldownMs > 0) return false;
+
+      const sceneTransitions = transitions[scene] || [];
+      const playerCenterX = player.x + player.w/2;
+      const playerCenterY = player.y + player.h/2;
+
+      for(const t of sceneTransitions){
+        if(inRect(playerCenterX, playerCenterY, t.zone)){
+          scene = t.targetScene;
+          player.x = t.playerTo.x;
+          player.y = t.playerTo.y;
+          player.facing = "down";
+          sceneCooldownMs = 700;
+          return true;
+        }
+      }
+
+      const cannibals = currentCannibals().slice();
+      for(const c of cannibals){
+        const cx = c.x + c.w/2;
+        const cy = c.y + c.h/2;
+
+        for(const t of sceneTransitions){
+          if(t.playerOnly) continue;
+          if(inRect(cx, cy, t.zone) && t.cannibalTo){
+            transferCannibal(c, scene, t.targetScene, t.cannibalTo);
+            break;
+          }
+        }
+      }
+
+      return false;
+    }
+
+    function handleItemPickups(){
+      const playerBox = {
+        x: player.x + 18,
+        y: player.y + 18,
+        w: player.w - 36,
+        h: player.h - 36
+      };
+
+      for(const item of currentItems()){
+        if(item.picked) continue;
+        if(rectsOverlap(playerBox, item)){
+          item.picked = true;
+
+          if(item.type === "health"){
+            const before = player.hp;
+            player.hp = Math.min(player.maxHp, player.hp + 35);
+            showMessage("Picked Health Kit +" + (player.hp - before) + " HP");
+          } else if(item.type === "food"){
+            const before = player.hp;
+            player.hp = Math.min(player.maxHp, player.hp + 20);
+            showMessage("Ate Food +" + (player.hp - before) + " HP");
+          } else if(item.type === "fuel"){
+            const gained = player.maxHp - player.hp;
+            player.hp = player.maxHp;
+            if(gained > 0){
+              showMessage("Picked Energy Drink. HP restored to max");
+            } else {
+              showMessage("Picked Energy Drink. HP already full");
+            }
+          } else if(item.type === "flare"){
+            player.hasFlareGun = true;
+            startEndingSequence();
+          }
+        }
+      }
+    }
+
+    function drawItem(item){
+      if(item.picked) return;
+
+      const sx = item.x - camera.x;
+      const sy = item.y - camera.y;
+
+      let img = null;
+      if(item.type === "health") img = healthImg;
+      if(item.type === "food") img = foodImg;
+      if(item.type === "fuel") img = energyImg;
+      if(item.type === "flare") img = flareImg;
+
+      if(img){
+        ctx.drawImage(img, sx, sy, item.w, item.h);
+      }
+
+      ctx.fillStyle = "#fff";
+      ctx.font = "12px monospace";
+      ctx.fillText(item.label, sx - 10, sy - 6);
+    }
+
+    function getEndingAlpha(totalDuration, timeLeft){
+      const elapsed = totalDuration - timeLeft;
+
+      if(elapsed < ENDING_FADE_MS){
+        return clamp(elapsed / ENDING_FADE_MS, 0, 1);
+      }
+
+      if(timeLeft < ENDING_FADE_MS){
+        return clamp(timeLeft / ENDING_FADE_MS, 0, 1);
+      }
+
+      return 1;
+    }
+
+    function getIntroAlpha(timeInImage){
+      if(timeInImage < INTRO_FADE_MS){
+        return clamp(timeInImage / INTRO_FADE_MS, 0, 1);
+      }
+
+      if(timeInImage < INTRO_FADE_MS + INTRO_HOLD_MS){
+        return 1;
+      }
+
+      const fadeOutTime = timeInImage - (INTRO_FADE_MS + INTRO_HOLD_MS);
+      return clamp(1 - (fadeOutTime / INTRO_FADE_MS), 0, 1);
+    }
+
+    function drawFullScreenImageFaded(img, alpha){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+      const drawW = img.width * scale;
+      const drawH = img.height * scale;
+      const dx = (canvas.width - drawW) / 2;
+      const dy = (canvas.height - drawH) / 2;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(img, dx, dy, drawW, drawH);
+      ctx.restore();
+    }
+
+    function drawIntroHint(){
+      const currentIntroImg = introImages[introIndex];
+      const canSkipIntro = currentIntroImg === start2Img || currentIntroImg === start3Img;
+      if(!canSkipIntro) return;
+
+      const pulse = 0.65 + 0.35 * Math.sin(performance.now() * 0.008);
+
+      ctx.save();
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(canvas.width/2 - 170, canvas.height - 72, 340, 40);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "20px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("PRESS SPACE TO START", canvas.width/2, canvas.height - 45);
+      ctx.restore();
+
+      ctx.textAlign = "start";
+    }
+
+    function drawPlayAgainButton(){
+      ctx.save();
+      ctx.fillStyle = playAgainButton.hovered ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.82)";
+      ctx.fillRect(playAgainButton.x, playAgainButton.y, playAgainButton.w, playAgainButton.h);
+
+      ctx.strokeStyle = "#111";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(playAgainButton.x, playAgainButton.y, playAgainButton.w, playAgainButton.h);
+
+      ctx.fillStyle = "#111";
+      ctx.font = "24px monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("PLAY AGAIN", playAgainButton.x + playAgainButton.w/2, playAgainButton.y + playAgainButton.h/2);
+      ctx.restore();
+
+      ctx.textAlign = "start";
+      ctx.textBaseline = "alphabetic";
+    }
+
+    let last = performance.now();
+    let gameOver = false;
+
+    function update(dt){
+      if(gameOver) return;
+
+      if(gameState === "intro"){
+        introTimer += dt;
+        if(introTimer >= INTRO_IMAGE_DURATION){
+          introTimer = 0;
+          introIndex++;
+          if(introIndex >= introImages.length){
+            startGameNow();
+          }
+        }
+        return;
+      }
+
+      if(endingState === "final1"){
+        final1Timer -= dt;
+        if(final1Timer <= 0){
+          switchToFinal2();
+        }
+        return;
+      }
+
+      if(endingState === "final2"){
+        final2Timer -= dt;
+        if(final2Timer <= 0){
+          helicopterSound.pause();
+          endingState = "ended";
+        }
+        return;
+      }
+
+      if(endingState === "ended") return;
+
+      sceneCooldownMs = Math.max(0, sceneCooldownMs - dt);
+      messageTimer = Math.max(0, messageTimer - dt);
+
+      let vx=0, vy=0;
+      let moving = false;
+
+      if(keys.up){ vy-=1; moving = true; }
+      if(keys.down){ vy+=1; moving = true; }
+      if(keys.left){ vx-=1; moving = true; }
+      if(keys.right){ vx+=1; moving = true; }
+
+      if(moving){
+        playStepSound();
+      }
+
+      const len = Math.hypot(vx,vy);
+      if(len>0){ vx/=len; vy/=len; }
+      player.facing = facingFromVelocity(vx,vy,player.facing);
+
+      if(dodgePressed && player.dodgeTime<=0){
+        playDodgeSound();
+        player.dodgeTime = 300;
+        player.invuln = 300;
+        player.spinAngle = 0;
+      }
+      dodgePressed = false;
+
+      const moveSpeed = (player.dodgeTime>0) ? DODGE_SPEED : player.speed;
+      const dx = vx * moveSpeed;
+      const dy = vy * moveSpeed;
+
+      if(player.dodgeTime>0){
+        player.dodgeTime -= dt;
+        player.spinAngle += dt*0.02;
+      } else {
+        player.spinAngle = 0;
+      }
+
+      moveWithMaskPlayer(currentMask(), player, dx, dy);
+
+      const map = currentMap();
+      player.x = clamp(player.x, 0, map.width - player.w);
+      player.y = clamp(player.y, 0, map.height - player.h);
+
+      handleItemPickups();
+
+      if(endingState !== "play"){
+        return;
+      }
+
+      if(handleSceneTransitions()){
+        return;
+      }
+
+      const px = player.x + player.w/2;
+      const py = player.y + player.h/2;
+
+      camera.x = clamp(px - canvas.width/2, 0, currentMap().width - canvas.width);
+      camera.y = clamp(py - canvas.height/2, 0, currentMap().height - canvas.height);
+
+      player.attackCooldown = Math.max(0, player.attackCooldown - dt);
+      player.attackTime = Math.max(0, player.attackTime - dt);
+      player.invuln = Math.max(0, player.invuln - dt);
+
+      if(attackPressed && player.attackCooldown===0){
+        playHitSound();
+        player.attackTime = 180;
+        player.attackCooldown = 260;
+
+        for(const c of currentCannibals()){
+          if(!c.alive) continue;
+          const cx = c.x + c.w/2;
+          const cy = c.y + c.h/2;
+          if(dist(px,py,cx,cy) <= HIT_RANGE){
+            c.hp -= DAMAGE;
+            if(c.hp <= 0) c.alive = false;
+            break;
+          }
+        }
+      }
+      attackPressed = false;
+
+      for(const c of currentCannibals()){
+        if(!c.alive) continue;
+
+        c.cooldown = Math.max(0, c.cooldown - dt);
+
+        const cx = c.x + c.w/2;
+        const cy = c.y + c.h/2;
+        const d = dist(px,py,cx,cy);
+
+        c.vx = 0;
+        c.vy = 0;
+
+        if(d < CHASE_RADIUS){
+          const dxp = px - cx;
+          const dyp = py - cy;
+          const l = Math.hypot(dxp,dyp) || 1;
+          c.vx = (dxp/l) * 1.35;
+          c.vy = (dyp/l) * 1.35;
+
+          moveWithMaskCannibal(currentMask(), c, c.vx, c.vy);
+          c.facing = facingFromVelocity(c.vx,c.vy,c.facing);
+        }
+
+        if(sceneCooldownMs === 0){
+          const sceneTransitions = transitions[scene] || [];
+          const ccx = c.x + c.w/2;
+          const ccy = c.y + c.h/2;
+          for(const t of sceneTransitions){
+            if(t.playerOnly) continue;
+            if(t.cannibalTo && inRect(ccx, ccy, t.zone)){
+              transferCannibal(c, scene, t.targetScene, t.cannibalTo);
+              sceneCooldownMs = 700;
+              break;
+            }
+          }
+        }
+
+        if(d < 70 && c.cooldown===0 && player.invuln===0){
+          player.hp -= CANNIBAL_DAMAGE;
+          c.cooldown = 900;
+          if(player.hp <= 0){
+            player.hp = 0;
+            gameOver = true;
+            stopAudio(horrorMusic);
+            stopAudio(flareSound);
+            stopAudio(helicopterSound);
+            stopAllActionSounds();
+            resetMovementKeys();
+          }
+        }
+      }
+    }
+
+    function drawHud(){
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(12,12,200,70);
+      ctx.fillStyle = "#9f9";
+      ctx.font = "14px monospace";
+      ctx.fillText("Scene: " + scene.toUpperCase(), 20, 34);
+      ctx.fillText("HP: " + player.hp + "/" + player.maxHp, 20, 54);
+      ctx.fillText("E -> Attack | D -> Dodge", 20, 74);
+
+      if(messageTimer > 0 && messageText){
+        ctx.fillStyle = "rgba(0,0,0,0.75)";
+        ctx.fillRect(12, 156, 420, 32);
+        ctx.fillStyle = "#fff";
+        ctx.font = "16px monospace";
+        ctx.fillText(messageText, 22, 178);
+      }
+    }
+
+    function draw(){
+      if(gameState === "intro"){
+        const img = introImages[introIndex];
+        const alpha = getIntroAlpha(introTimer);
+        drawFullScreenImageFaded(img, alpha);
+        drawIntroHint();
+        return;
+      }
+
+      if(endingState === "final1"){
+        const alpha = getEndingAlpha(FINAL1_DURATION, final1Timer);
+        drawFullScreenImageFaded(final1Img, alpha);
+        return;
+      }
+
+      if(endingState === "final2"){
+        const alpha = getEndingAlpha(FINAL2_DURATION, final2Timer);
+        drawFullScreenImageFaded(final2Img, alpha);
+        return;
+      }
+
+      if(endingState === "ended"){
+        drawFullScreenImageFaded(final2Img, 1);
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        drawPlayAgainButton();
+        return;
+      }
+
+      ctx.drawImage(
+        currentMap(),
+        camera.x, camera.y,
+        canvas.width, canvas.height,
+        0, 0,
+        canvas.width, canvas.height
+      );
+
+      for(const item of currentItems()){
+        drawItem(item);
+      }
+
+      for(const c of currentCannibals()){
+        if(!c.alive) continue;
+        drawRotated(cannibalImg, c.x-camera.x, c.y-camera.y, SIZE, c.facing);
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(c.x-camera.x, c.y-camera.y-10, SIZE, 6);
+        ctx.fillStyle = "rgba(255,80,80,0.95)";
+        ctx.fillRect(c.x-camera.x, c.y-camera.y-10, SIZE*(c.hp/c.maxHp), 6);
+      }
+
+      let scale = 1;
+      if(player.attackTime>0) scale = 1.18;
+      drawRotated(playerImg, player.x-camera.x, player.y-camera.y, SIZE, player.facing, player.spinAngle, scale);
+
+      drawHud();
+
+      if(gameOver){
+        ctx.fillStyle = "rgba(0,0,0,0.78)";
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = "#ff4444";
+        ctx.font = "48px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("GAME OVER", canvas.width/2, canvas.height/2 - 30);
+        ctx.textAlign = "start";
+        drawPlayAgainButton();
+      }
+    }
+
+    function loop(now){
+      const dt = now - last;
+      last = now;
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+
+  }catch(err){
+    drawStatus([
+      "ERROR:",
+      String(err.message || err),
+      "",
+      "Run:",
+      "python -m http.server 8000",
+      "Then open:",
+      "http://localhost:8000"
+    ]);
+  }
+})();
+</script>
+</body>
+</html>
